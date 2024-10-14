@@ -1,9 +1,25 @@
+import csv
+import json
 import os
+import random as rd
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 from docetl.parsing_tools import get_parser, get_parsing_tools
 from docetl.schemas import ParsingTool
+
+from diskcache import Index
+import mmap
+from io import StringIO
+
+
+DOCETL_HOME_DIR = os.path.expanduser("~/.docetl")
+
+CACHE_DIR = os.path.join(DOCETL_HOME_DIR, "cache")
+DATASET_CACHE_DIR = os.path.join(CACHE_DIR, "datasets")
+DatasetsDiskCacheIndex = Index(dir=DATASET_CACHE_DIR)
+DatasetsDiskCacheIndex.cache.close()
 
 
 def create_parsing_tool_map(
@@ -64,6 +80,9 @@ class Dataset:
         self.path_or_data = self._validate_path_or_data(path_or_data)
         self.parsing = self._validate_parsing(parsing)
         self.user_defined_parsing_tool_map = user_defined_parsing_tool_map
+        self.file_data = None
+        self.data_hash = None
+        self.file_metadata = {"size": None, "mtime": None}
 
     def _validate_type(self, type: str) -> str:
         """
@@ -168,32 +187,36 @@ class Dataset:
         """
         return f"Dataset(type='{self.type}', source='{self.source}', path_or_data='{self.path_or_data}', parsing={self.parsing})"
 
-    def load(self) -> List[Dict]:
-        """
-        Load the dataset from the specified path or return the in-memory data.
+    def _compute_hash(self, data: List[Dict]) -> int:
+        hasher = hashlib.md5()
+        for item in data:
+            # Sort the keys to ensure consistent ordering
+            sorted_item = json.dumps(item, sort_keys=True)
+            hasher.update(sorted_item.encode("utf-8"))
+        return int(hasher.hexdigest(), 16)
 
-        Returns:
-            List[Dict]: A list of dictionaries representing the dataset.
-
-        Raises:
-            ValueError: If the file extension is unsupported.
-        """
+    def _dataloader(self) -> int:
         if self.type == "memory":
-            return self._apply_parsing_tools(self.path_or_data)
+            self.data_hash = self._compute_hash(self.path_or_data)
+            return self.data_hash
+
+        file_stat = os.stat(self.path_or_data)
+        current_size = file_stat.st_size
+        current_mtime = file_stat.st_mtime
+
+        if (
+            self.file_metadata["size"] == current_size
+            and self.file_metadata["mtime"] == current_mtime
+            and self.file_data is not None
+        ):
+            return self._compute_hash(self.file_data)
 
         _, ext = os.path.splitext(self.path_or_data.lower())
 
         if ext == ".json":
-            import json
-
-            with open(self.path_or_data, "r") as f:
-                data = json.load(f)
+            self._load_json(self.path_or_data)
         elif ext == ".csv":
-            import csv
-
-            with open(self.path_or_data, "r") as f:
-                reader = csv.DictReader(f)
-                data = list(reader)
+            self._load_csv(self.path_or_data)
         else:
             raise ValueError(f"Unsupported file extension: {ext}")
 
@@ -250,88 +273,89 @@ class Dataset:
                         f"Parsing tool {tool['function']} not found. Please define it or use one of our existing parsing tools: {get_parsing_tools()}"
                     )
 
-            new_data = []
+                result = func(item, **function_kwargs)
+                output.extend([item | res for res in result])
+            return output
 
-            with ThreadPoolExecutor() as executor:
-                futures = [
-                    executor.submit(
-                        self._process_item,
-                        item,
-                        func,
-                        **function_kwargs,
-                    )
-                    for item in data
-                ]
-                for future in as_completed(futures):
-                    new_data.extend(future.result())
+        parsed_data = []
 
-            data = new_data
+        with ThreadPoolExecutor() as executor:
+            futures = [
+                executor.submit(process_item, item, self.parsing) for item in data
+            ]
+            for future in as_completed(futures):
+                parsed_data.extend(future.result())
 
-        return data
+        assert len(parsed_data) > 0, "No data was returned from parsing tools"
+        DatasetsDiskCacheIndex[self.data_hash] = parsed_data
+        return parsed_data
 
-    def sample(self, n: int, random: bool = True) -> List[Dict]:
+    def load(self) -> List[Dict]:
         """
-        Sample n items from the dataset.
+        Load the dataset from the specified path or return the in-memory data.
+
+        Returns:
+            List[Dict]: A list of dictionaries representing the dataset.
+
+        Raises:
+            ValueError: If the file extension is unsupported.
+        """
+        self._dataloader()
+        return self._apply_parsing_tools()
+
+    def sample(self, n: int, random_sample: bool = True) -> List[Dict]:
+        """
+        Sample n items from the parsed dataset.
 
         Args:
             n (int): Number of items to sample.
-            random (bool): If True, sample randomly. If False, take the first n items.
+            random_sample (bool): If True, sample randomly. If False, take the first n items.
 
         Returns:
             List[Dict]: A list of n sampled items.
 
         Raises:
-            ValueError: If the sample size is larger than the dataset size or if the file extension is unsupported.
+            ValueError: If the sample size is larger than the dataset size.
         """
-        if self.type == "memory":
-            import random as rd
+        parsed_data = self.load()  # This will use cached data if available
 
-            data = self.path_or_data
-            if n > len(data):
-                raise ValueError(
-                    f"Sample size {n} is larger than dataset size {len(data)}"
-                )
-            sampled_data = rd.sample(data, n) if random else data[:n]
-            return self._apply_parsing_tools(sampled_data)
+        if n > len(parsed_data):
+            raise ValueError(
+                f"Sample size {n} is larger than dataset size {len(parsed_data)}"
+            )
 
-        _, ext = os.path.splitext(self.path_or_data.lower())
-
-        if ext == ".json":
-            import json
-            import random as rd
-
-            with open(self.path_or_data, "r") as f:
-                if random:
-                    data = json.load(f)
-                    if n > len(data):
-                        raise ValueError(
-                            f"Sample size {n} is larger than dataset size {len(data)}"
-                        )
-                    sampled_data = rd.sample(data, n)
-                else:
-                    sampled_data = []
-                    for i, line in enumerate(f):
-                        if i >= n:
-                            break
-                        sampled_data.append(json.loads(line))
-
-        elif ext == ".csv":
-            import csv
-            import random as rd
-
-            with open(self.path_or_data, "r") as f:
-                reader = csv.DictReader(f)
-                if random:
-                    data = list(reader)
-                    if n > len(data):
-                        raise ValueError(
-                            f"Sample size {n} is larger than dataset size {len(data)}"
-                        )
-                    sampled_data = rd.sample(data, n)
-                else:
-                    sampled_data = [next(reader) for _ in range(n)]
-
+        if random_sample:
+            return rd.sample(parsed_data, n)
         else:
-            raise ValueError(f"Unsupported file extension: {ext}")
+            return parsed_data[:n]
 
-        return self._apply_parsing_tools(sampled_data)
+    def _load_csv(self, path: str):
+        with open(path, "r+b") as f:
+            # Memory-map the file for faster access
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+
+            # Use StringIO to create a file-like object from the memory-mapped file
+            csv_data = StringIO(mm.read().decode("utf-8"))
+
+            # Use csv.DictReader for efficient parsing
+            reader = csv.DictReader(csv_data)
+
+            # Use a generator expression instead of a list comprehension
+            self.file_data = (dict(row) for row in reader)
+
+            # Close the memory-map
+            mm.close()
+
+    def _load_json(self, path: str):
+        with open(path, "r+b") as f:
+            # Memory-map the file for faster access
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+
+            # Use StringIO to create a file-like object from the memory-mapped file
+            json_data = StringIO(mm.read().decode("utf-8"))
+
+            # Use json.load for parsing
+            self.file_data = json.load(json_data)
+
+            # Close the memory-map
+            mm.close()
