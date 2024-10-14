@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from dotenv import load_dotenv
 import hashlib
+from rich.console import Console
 
 from docetl.dataset import Dataset, create_parsing_tool_map
 from docetl.operations import get_operation, get_operations
