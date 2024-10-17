@@ -15,8 +15,13 @@ from io import StringIO
 
 
 DOCETL_HOME_DIR = os.path.expanduser("~/.docetl")
-
-CACHE_DIR = os.path.join(DOCETL_HOME_DIR, "cache")
+# if benchmarking and a cache is specified, let's use that location
+if os.environ.get("BENCHMARK_CACHE_DIR"):
+    CACHE_DIR = os.environ["BENCHMARK_CACHE_DIR"]
+else:
+    CACHE_DIR = os.path.join(DOCETL_HOME_DIR, "cache")
+# ensure the cache directory exists
+os.makedirs(CACHE_DIR, exist_ok=True)
 DATASET_CACHE_DIR = os.path.join(CACHE_DIR, "datasets")
 DatasetsDiskCacheIndex = Index(dir=DATASET_CACHE_DIR)
 DatasetsDiskCacheIndex.cache.close()
@@ -197,6 +202,7 @@ class Dataset:
 
     def _dataloader(self) -> int:
         if self.type == "memory":
+            # we have not way to determine if the data is the same, so we need to (re)compute the hash
             self.data_hash = self._compute_hash(self.path_or_data)
             return self.data_hash
 
@@ -208,8 +214,9 @@ class Dataset:
             self.file_metadata["size"] == current_size
             and self.file_metadata["mtime"] == current_mtime
             and self.file_data is not None
+            and self.data_hash is not None
         ):
-            return self._compute_hash(self.file_data)
+            return self.data_hash
 
         _, ext = os.path.splitext(self.path_or_data.lower())
 
@@ -237,7 +244,12 @@ class Dataset:
 
         data = self.path_or_data if self.type == "memory" else self.file_data
 
-        if not data or not self.parsing:
+        if not data:
+            return data
+
+        if not self.parsing:
+            # we still need to add the data to the cache
+            DatasetsDiskCacheIndex[self.data_hash] = data
             return data
 
         def process_item(item, tools):
@@ -326,32 +338,42 @@ class Dataset:
             return parsed_data[:n]
 
     def _load_csv(self, path: str):
-        with open(path, "r+b") as f:
-            # Memory-map the file for faster access
-            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        # if file is less than 1MiB, let's just load it into memory
+        if os.path.getsize(path) <= 1024 * 1024:
+            with open(path, "r") as f:
+                self.file_data = csv.DictReader(f)
+        else:
+            with open(path, "r+b") as f:
+                # Memory-map the file for faster access
+                mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
 
-            # Use StringIO to create a file-like object from the memory-mapped file
-            csv_data = StringIO(mm.read().decode("utf-8"))
+                # Use StringIO to create a file-like object from the memory-mapped file
+                csv_data = StringIO(mm.read().decode("utf-8"))
 
-            # Use csv.DictReader for efficient parsing
-            reader = csv.DictReader(csv_data)
+                # Use csv.DictReader for efficient parsing
+                reader = csv.DictReader(csv_data)
 
-            # Use a generator expression instead of a list comprehension
-            self.file_data = (dict(row) for row in reader)
+                # Use a generator expression instead of a list comprehension
+                self.file_data = (dict(row) for row in reader)
 
-            # Close the memory-map
-            mm.close()
+                # Close the memory-map
+                mm.close()
 
     def _load_json(self, path: str):
-        with open(path, "r+b") as f:
-            # Memory-map the file for faster access
-            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        # if file is less than 1MiB, let's just load it into memory
+        if os.path.getsize(path) <= 1024 * 1024:
+            with open(path, "r") as f:
+                self.file_data = json.load(f)
+        else:
+            with open(path, "r+b") as f:
+                # Memory-map the file for faster access
+                mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
 
-            # Use StringIO to create a file-like object from the memory-mapped file
-            json_data = StringIO(mm.read().decode("utf-8"))
+                # Use StringIO to create a file-like object from the memory-mapped file
+                json_data = StringIO(mm.read().decode("utf-8"))
 
-            # Use json.load for parsing
-            self.file_data = json.load(json_data)
+                # Use json.load for parsing
+                self.file_data = json.load(json_data)
 
-            # Close the memory-map
-            mm.close()
+                # Close the memory-map
+                mm.close()

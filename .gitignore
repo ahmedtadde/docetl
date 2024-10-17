@@ -52,3 +52,4 @@ website/*.tsbuildinfo
 website/next-env.d.ts
 .python-version
 .vscode
+benches/tmp/
