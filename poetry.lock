@@ -4569,4 +4569,4 @@ parsing = ["azure-ai-documentintelligence", "openpyxl", "paddleocr", "paddlepadd
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.10"
-content-hash = "6cfc3498d69d4df1672e110994e4791b4d163615f146f36f041a90dced5846ea"
+content-hash = "1c9d86888b29d75953698923f9497496a883b4283e6e16f0ff5caa1c1617a93e"

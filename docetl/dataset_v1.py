@@ -1,25 +1,10 @@
-import hashlib
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable, Dict, List, Optional, Union
-import uuid
-import random as rd
-from diskcache import Cache, FanoutCache
+from typing import Any, Callable, Dict, List, Optional, Union, Literal
+from pydantic import BaseModel
 
 from docetl.parsing_tools import get_parser, get_parsing_tools
-from docetl.schemas import ParsingTool
-
-DOCETL_HOME_DIR = os.path.expanduser("~/.docetl")
-if os.environ.get("CACHE_DIR"):
-    dir = os.environ["CACHE_DIR"].strip()
-    CACHE_DIR = dir if dir else os.path.join(DOCETL_HOME_DIR, "cache")
-else:
-    CACHE_DIR = os.path.join(DOCETL_HOME_DIR, "cache")
-# ensure the cache directory exists
-os.makedirs(CACHE_DIR, exist_ok=True)
-DATASET_CACHE_DIR = os.path.join(CACHE_DIR, "datasets")
-DatasetsDiskCache = FanoutCache(directory=DATASET_CACHE_DIR)
-DatasetsDiskCache.close()
+from docetl.base_schemas import ParsingTool
 
 
 def create_parsing_tool_map(
@@ -53,8 +38,41 @@ class Dataset:
         path_or_data (Union[str, List[Dict]]): The file path or in-memory data.
         parsing (List[Dict[str, str]]): A list of parsing tools to apply to the data.
         user_defined_parsing_tool_map (Dict[str, ParsingTool]): A map of user-defined parsing tools.
-        dataset_id (str): A unique identifier for the dataset.
     """
+
+    class schema(BaseModel):
+        """
+        Represents a dataset configuration in the pipeline.
+
+        Attributes:
+            type (str): The type of the dataset. Must be either 'file' or 'memory'.
+            path (str): The path to the dataset file or the in-memory data, depending on the type.
+            source (str): The source of the dataset. Currently, only 'local' is supported. Defaults to 'local'.
+            parsing (Optional[List[Dict[str, str]]]): A list of parsing tools to apply to the data. Each parsing tool
+                                                      is represented by a dictionary with 'input_key', 'function', and
+                                                      'output_key' keys. Defaults to None.
+
+        Example:
+            ```yaml
+            datasets:
+              my_dataset:
+                type: file
+                path: input.json
+                parsing:
+                  - input_key: file_path
+                    function: txt_to_string
+                    output_key: content
+            ```
+
+        Note:
+            The parsing tools are applied in the order they are listed. Each parsing tool takes the output
+            of the previous tool as its input, allowing for chained processing of the data.
+        """
+
+        type: Literal["file", "memory"]
+        path: str
+        source: str = "local"
+        parsing: Optional[List[Dict[str, str]]] = None
 
     def __init__(
         self,
@@ -64,8 +82,6 @@ class Dataset:
         source: str = "local",
         parsing: List[Dict[str, str]] = None,
         user_defined_parsing_tool_map: Dict[str, ParsingTool] = {},
-        dataset_id: str = uuid.uuid4(),
-        cache_store: Optional[Cache] = DatasetsDiskCache,
     ):
         """
         Initialize a Dataset object.
@@ -76,8 +92,6 @@ class Dataset:
             path_or_data (Union[str, List[Dict]]): The file path or in-memory data.
             parsing (List[Dict[str, str]], optional): A list of parsing tools to apply to the data.
             user_defined_parsing_tool_map (Dict[str, ParsingTool], optional): A map of user-defined parsing tools.
-            dataset_id (str): A unique identifier for the dataset.
-            cache_store (Cache, optional): The (DiskCache) cache store to use for caching the dataset.
         """
         self.runner = runner
         self.type = self._validate_type(type)
@@ -85,9 +99,6 @@ class Dataset:
         self.path_or_data = self._validate_path_or_data(path_or_data)
         self.parsing = self._validate_parsing(parsing)
         self.user_defined_parsing_tool_map = user_defined_parsing_tool_map
-        self.dataset_id = dataset_id
-        self._cache_store = cache_store
-        self._length = None
 
     def _validate_type(self, type: str) -> str:
         """
@@ -202,14 +213,6 @@ class Dataset:
         Raises:
             ValueError: If the file extension is unsupported.
         """
-
-        if self._cache_store:
-            cached_parsed_data = self._cache_store.get(
-                self._cache_key(self.path_or_data)
-            )
-            if cached_parsed_data:
-                return cached_parsed_data
-
         if self.type == "memory":
             return self._apply_parsing_tools(self.path_or_data)
 
@@ -229,9 +232,7 @@ class Dataset:
         else:
             raise ValueError(f"Unsupported file extension: {ext}")
 
-        data = self._apply_parsing_tools(data)
-        self._length = len(data)
-        return data
+        return self._apply_parsing_tools(data)
 
     def _process_item(
         self,
@@ -301,12 +302,6 @@ class Dataset:
 
             data = new_data
 
-        if self._cache_store:
-            try:
-                self._cache_store.set(self._cache_key(self.path_or_data), data)
-            except Exception as e:
-                print(f"Failed to cache parsed data: {e}")
-
         return data
 
     def sample(self, n: int, random: bool = True) -> List[Dict]:
@@ -323,42 +318,55 @@ class Dataset:
         Raises:
             ValueError: If the sample size is larger than the dataset size or if the file extension is unsupported.
         """
+        if self.type == "memory":
+            import random as rd
 
-        data = self.load()
-        if n > len(data):
-            raise ValueError(f"Sample size {n} is larger than dataset size {len(data)}")
-        return rd.sample(data, n) if random else data[:n]
+            data = self.path_or_data
+            if n > len(data):
+                raise ValueError(
+                    f"Sample size {n} is larger than dataset size {len(data)}"
+                )
+            sampled_data = rd.sample(data, n) if random else data[:n]
+            return self._apply_parsing_tools(sampled_data)
 
-    def _cache_key(self, path_or_data: Union[str, List[Dict]]) -> str:
-        """
-        Generate a cache key for the dataset.
+        _, ext = os.path.splitext(self.path_or_data.lower())
 
-        Args:
-            path_or_data (Union[str, List[Dict]]): The path or data to generate a cache key for.
+        if ext == ".json":
+            import json
+            import random as rd
 
-        Returns:
-            str: A cache key for the dataset.
-        """
+            with open(self.path_or_data, "r") as f:
+                if random:
+                    data = json.load(f)
+                    if n > len(data):
+                        raise ValueError(
+                            f"Sample size {n} is larger than dataset size {len(data)}"
+                        )
+                    sampled_data = rd.sample(data, n)
+                else:
+                    sampled_data = []
+                    for i, line in enumerate(f):
+                        if i >= n:
+                            break
+                        sampled_data.append(json.loads(line))
 
-        assert isinstance(path_or_data, str) or isinstance(
-            path_or_data, list
-        ), "path_or_data must be a file path or a list of dictionaries"
+        elif ext == ".csv":
+            import csv
+            import random as rd
 
-        if isinstance(path_or_data, str):
-            file_size = os.path.getsize(path_or_data)
-            last_modified = round(
-                os.path.getmtime(path_or_data), 3
-            )  # Round to milliseconds
-            # TODO: Investigate different options for hashing
-            return hashlib.sha256(
-                f"{path_or_data}_{file_size}_{last_modified}".encode()
-            ).hexdigest()
+            with open(self.path_or_data, "r") as f:
+                reader = csv.DictReader(f)
+                if random:
+                    data = list(reader)
+                    if n > len(data):
+                        raise ValueError(
+                            f"Sample size {n} is larger than dataset size {len(data)}"
+                        )
+                    sampled_data = rd.sample(data, n)
+                else:
+                    sampled_data = [next(reader) for _ in range(n)]
 
-        if isinstance(path_or_data, list):
-            # when in-memory, just return the dataset id
-            return self.dataset_id
+        else:
+            raise ValueError(f"Unsupported file extension: {ext}")
 
-    def __len__(self):
-        if self._length is None:
-            self._length = len(self.load())
-        return self._length
+        return self._apply_parsing_tools(sampled_data)
