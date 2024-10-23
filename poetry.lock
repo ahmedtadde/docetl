@@ -4058,21 +4058,6 @@ files = [
 ]
 
 [[package]]
-name = "tenacity"
-version = "9.0.0"
-description = "Retry code until it succeeds"
-optional = false
-python-versions = ">=3.8"
-files = [
-    {file = "tenacity-9.0.0-py3-none-any.whl", hash = "sha256:93de0c98785b27fcf659856aa9f54bfbd399e29969b0621bc7f762bd441b4539"},
-    {file = "tenacity-9.0.0.tar.gz", hash = "sha256:807f37ca97d62aa361264d497b0e31e92b8027044942bfa756160d908320d73b"},
-]
-
-[package.extras]
-doc = ["reno", "sphinx"]
-test = ["pytest", "tornado (>=4.5)", "typeguard"]
-
-[[package]]
 name = "termcolor"
 version = "2.5.0"
 description = "ANSI color formatting for output in terminal"
@@ -4569,4 +4554,4 @@ parsing = ["azure-ai-documentintelligence", "openpyxl", "paddleocr", "paddlepadd
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.10"
-content-hash = "1c9d86888b29d75953698923f9497496a883b4283e6e16f0ff5caa1c1617a93e"
+content-hash = "492e352f2364559d37223d6c88069c6a9d586f2f08e8d02deef65ccde07a2194"
